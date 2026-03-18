@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Talk notes - Charles Connell - 2 April 2026 HBase meetup</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<style>
+  body {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+    font-size: 16px;
+    margin: 0;
+    padding: 20px;
+    background: #0d1117;
+    color: #c9d1d9;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: bold;
+    color: #58a6ff;
+    margin-bottom: 20px;
+  }
+  h1::before { content: "> "; color: #7ee787; }
+  h2 {
+    font-size: 18px;
+    font-weight: bold;
+    color: #7ee787;
+    margin-top: 20px;
+    margin-bottom: 8px;
+  }
+  .summary-body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 16px;
+  }
+  .summary-body code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+  }
+  h2::before { content: "## "; color: #6e7681; }
+  p, li { color: #c9d1d9; line-height: 1.6; }
+  a { color: #58a6ff; }
+  em { color: #ffa657; font-style: normal; }
+  code {
+    background: #161b22;
+    color: #79c0ff;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: inherit;
+  }
+  pre code {
+    background: transparent;
+    color: inherit;
+    padding: 0;
+  }
+  .hljs { background: #161b22 !important; border-radius: 4px; }
+  .main-section {
+    margin-bottom: 12px;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    background: #161b22;
+    overflow: hidden;
+  }
+  .main-header {
+    display: flex;
+    align-items: center;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+    background: #161b22;
+  }
+  .main-header:hover { background: #1f2937; }
+  .main-title {
+    font-weight: bold;
+    color: #c9d1d9;
+    flex: 1;
+  }
+  .main-title::before { content: "$ "; color: #7ee787; }
+  .main-toggle {
+    font-size: 12px;
+    color: #58a6ff;
+    transition: transform 0.2s;
+  }
+  .main-toggle.open { transform: rotate(90deg); }
+  .main-body {
+    display: none;
+    border-top: 1px solid #30363d;
+    padding: 16px;
+  }
+  .main-body.open { display: block; }
+  .main-body iframe {
+    width: 100%;
+    height: 100vh;
+    border: none;
+    display: block;
+  }
+  .sub-section {
+    margin: 8px 0;
+    border: 1px solid #21262d;
+    border-radius: 4px;
+    background: #0d1117;
+    overflow: hidden;
+  }
+  .sub-header {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+    background: #0d1117;
+  }
+  .sub-header:hover { background: #161b22; }
+  .sub-title {
+    font-weight: normal;
+    color: #8b949e;
+    flex: 1;
+  }
+  .sub-title::before { content: "> "; color: #58a6ff; }
+  .sub-toggle {
+    font-size: 12px;
+    color: #58a6ff;
+    transition: transform 0.2s;
+  }
+  .sub-toggle.open { transform: rotate(90deg); }
+  .sub-body {
+    display: none;
+    border-top: 1px solid #21262d;
+    padding: 12px;
+  }
+  .sub-body.open { display: block; }
+</style>
+</head>
+<body>
+
+<h1>Reducing garbage collection in the read path - Charles Connell - 2 April 2026 HBase meetup</h1>
+
+<p style="color: #666; font-style: italic;">The flamegraphs embedded in this page are known to render correctly in Firefox and Safari, but not in Chrome.</p>
+
+<div class="main-section">
+  <div class="main-header" onclick="toggle(this)">
+    <span class="main-title">Before</span>
+    <span class="main-toggle">&#9654;</span>
+  </div>
+  <div class="main-body" style="padding: 16px;">
+    <div class="sub-section">
+      <div class="sub-header" onclick="toggle(this)">
+        <span class="sub-title">Problem: CodecPool#borrow() and CodecPool#payback() allocate</span>
+        <span class="sub-toggle">&#9654;</span>
+      </div>
+      <div class="sub-body">
+        <iframe src="borrow-decompressor.html" loading="lazy"></iframe>
+      </div>
+    </div>
+
+    <div class="sub-section">
+      <div class="sub-header" onclick="toggle(this)">
+        <span class="sub-title">Solution: Use TreeSet so we can poll without allocating</span>
+        <span class="sub-toggle">&#9654;</span>
+      </div>
+      <div class="sub-body">
+        <p>CodecPool#borrow() changes from:</p>
+        <pre><code class="language-java">
+HashMap&lt;Class&lt;Compressor&gt;, HashSet&lt;Compressor&gt;&gt; pool;
+...
+
+private static &lt;T&gt; T borrow(Map&lt;Class&lt;T&gt;, Set&lt;T&gt;&gt; pool,
+                           Class&lt;? extends T&gt; codecClass) {
+  T codec = null;
+
+  // Check if an appropriate codec is available
+  Set&lt;T&gt; codecSet;
+  synchronized (pool) {
+    codecSet = pool.get(codecClass);
+  }
+
+  if (codecSet != null) {
+    synchronized (codecSet) {
+      if (!codecSet.isEmpty()) {
+        codec = codecSet.iterator().next();
+        codecSet.remove(codec);
+      }
+    }
+  }
+
+  return codec;
+}
+        </code></pre>
+        <p>to:</p>
+        <pre><code class="language-java">
+ConcurrentHashMap&lt;Class&lt;Compressor&gt;, ConcurrentSkipListSet&lt;Compressor&gt;&gt; pool;
+...
+private static &lt;T&gt; T borrow(ConcurrentMap&lt;Class&lt;T&gt;, NavigableSet&lt;T&gt;&gt; pool,
+  Class&lt;? extends T&gt; codecClass) {
+  if (codecClass == null) {
+    return null;
+  }
+
+  NavigableSet&lt;T&gt; codecSet = pool.get(codecClass);
+  if (codecSet != null) {
+    // If a copy of the codec is available, pollFirst() will grab one.
+    // If not, it will return null.
+    return codecSet.pollFirst();
+  } else {
+    return null;
+  }
+}
+        </code></pre>
+        <p>CodecPool#payback() changes from:</p>
+        <pre><code class="language-java">
+HashMap&lt;Class&lt;Compressor&gt;, HashSet&lt;Compressor&gt;&gt; pool;
+...
+private static &lt;T&gt; boolean payback(Map&lt;Class&lt;T&gt;, Set&lt;T&gt;&gt; pool, T codec) {
+  if (codec != null) {
+    Class&lt;T&gt; codecClass = ReflectionUtils.getClass(codec);
+    Set&lt;T&gt; codecSet;
+    synchronized (pool) {
+      codecSet = pool.get(codecClass);
+      if (codecSet == null) {
+        codecSet = new HashSet&lt;T&gt;();
+        pool.put(codecClass, codecSet);
+      }
+    }
+
+    synchronized (codecSet) {
+      return codecSet.add(codec);
+    }
+  }
+  return false;
+}
+  
+        </code></pre>
+        <p>to:</p>
+        <pre><code class="language-java">
+ConcurrentHashMap&lt;Class&lt;Compressor&gt;, ConcurrentSkipListSet&lt;Compressor&gt;&gt; pool;
+...
+private static &lt;T&gt; boolean payback(ConcurrentMap&lt;Class&lt;T&gt;, NavigableSet&lt;T&gt;&gt; pool, T codec) {
+  if (codec != null) {
+    Class&lt;T&gt; codecClass = ReflectionUtils.getClass(codec);
+    Set&lt;T&gt; codecSet = pool.computeIfAbsent(codecClass,
+      k -&gt; new ConcurrentSkipListSet&lt;&gt;(Comparator.comparingInt(System::identityHashCode)));
+    return codecSet.add(codec);
+  }
+  return false;
+}
+        </code></pre>
+      </div>
+    </div>
+
+    <div class="sub-section">
+      <div class="sub-header" onclick="toggle(this)">
+        <span class="sub-title">Problem: CodecPool#borrow() accesses a Guava Cache to assist unit testing</span>
+        <span class="sub-toggle">&#9654;</span>
+      </div>
+      <div class="sub-body">
+        <iframe src="lease-counting.html" loading="lazy"></iframe>
+      </div>
+    </div>
+
+    <div class="sub-section">
+      <div class="sub-header">
+        <span class="sub-title">Solution: Only access the cache when running unit tests</span>
+      </div>
+    </div>
+
+    <div class="sub-section">
+      <div class="sub-header" onclick="toggle(this)">
+        <span class="sub-title">Problem: accessing decompressed bytes requires a BufferedInputStream</span>
+        <span class="sub-toggle">&#9654;</span>
+      </div>
+      <div class="sub-body">
+        <iframe src="create-decompression-stream-zstd.html" loading="lazy"></iframe>
+      </div>
+    </div>
+
+    <div class="sub-section">
+      <div class="sub-header">
+        <span class="sub-title">Solution: Create new fast-path for decompressors that can operate on ByteBuffs</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="main-section">
+  <div class="main-header" onclick="toggle(this)">
+    <span class="main-title">After</span>
+    <span class="main-toggle">&#9654;</span>
+  </div>
+  <div class="main-body" style="padding: 16px;">
+    <div class="sub-section">
+      <div class="sub-header" onclick="toggle(this)">
+        <span class="sub-title">GC rate</span>
+        <span class="sub-toggle">&#9654;</span>
+      </div>
+      <div class="sub-body">
+        <img src="gc_rate.png" style="width: 100%; display: block;"/>
+      </div>
+    </div>
+
+    <div class="sub-section">
+      <div class="sub-header" onclick="toggle(this)">
+        <span class="sub-title">Profile</span>
+        <span class="sub-toggle">&#9654;</span>
+      </div>
+      <div class="sub-body">
+        <iframe src="healthy-gets.html" loading="lazy"></iframe>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="main-section">
+  <div class="main-header" onclick="toggle(this)">
+    <span class="main-title">Summary</span>
+    <span class="main-toggle">&#9654;</span>
+  </div>
+  <div class="main-body summary-body" style="padding: 16px;">
+    <p>My thesis is that the less we use the garbage collector, the better. Every allocation on the heap incurs several costs:</p>
+    <ol>
+      <li>Time is spent to allocate the object, assuming it doesn't fit in the thread-local allocation buffer. If there isn't heap pressure, this takes some cycles but isn't terrible. If there is heap pressure, then you get an allocation stall, which is very damaging to request latency.</li>
+      <li>Time is spent to clean up the object when it's no longer used. Garbage collection is hard work, and it uses a lot of our CPU cycles. The less garbage we generate, the less needs to get cleaned up, and the more CPU cycles can be devoted to handling user requests.</li>
+      <li>Access to on-heap <code>byte[]</code> by native code requires <a href="https://github.com/charlesconnell/zstd-jni/blob/67dd1816b311e72926270e017dfc7aacf0fb618d/src/main/native/jni_fast_zstd.c#L488">taking a lock</a> that blocks the garbage collector. This can incur a <em>JNI critical section stall</em> while a thread waits for that lock. In HBase, this presents when we use libzstd-jni for HFile decompression, and the ByteBuff provided to us by the ByteBuffAllocator is an on-heap buffer. The less often we use on-heap <code>ByteBuff</code>s, the less JNI critical section stalls we get, and the less often they slow down request handling.</li>
+      <li>In the way the JDK is written, system calls that read or write to userspace memory always interact with direct (off-heap) <code>ByteBuffer</code>s. For example, if an on-heap <code>ByteBuffer</code> is passed as the output buffer to a <code>FileChannel</code> read, <a href="https://github.com/adoptium/jdk21u/blob/master/src/java.base/share/classes/sun/nio/ch/IOUtil.java#L84">internally a direct <code>ByteBuffer</code> is actually used</a>, and the result is copied back to your on-heap buffer. If you can pass a direct <code>ByteBuffer</code> to the JDK, it will use it directly and avoid a copy.</li>
+    </ol>
+
+    <p>See details below for how I'm making changes related to one of more of these bullet points.</p>
+
+    <h2>ZStandard decompression</h2>
+    <p>Decompression is a very hot path in HBase. Any little inefficiency is obvious on a CPU profile. This section was a campaign to reduce allocations made and unnecessary copies incurred around the decompression process. Ideally during an HBase block read, direct ByteBuffs are used for the block data, and reads and writes go directly to that ByteBuffs. In the case of decompression, HBase gives us a ByteBuff of compressed data, and a ByteBuff for the uncompressed result to go in. My work passes these memory regions straight through to libzstd-jni, and also does some miscellaneous performance enhancements. Solves for bullet points 1, 2, and 3.</p>
+    <ul>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-28485">HBASE-28485</a>: Re-use <code>ZstdDecompressCtx</code>/<code>ZstdCompressCtx</code> for performance</li>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-29123">HBASE-29123</a>: A faster <code>CodecPool</code> for HBase</li>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-29135">HBASE-29135</a>: ZStandard decompression can operate directly on <code>ByteBuff</code>s</li>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-29172">HBASE-29172</a>: Fix bug in <code>ZstdByteBuffDecompressor</code></li>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-29193">HBASE-29193</a>: Allow <code>ZstdByteBuffDecompressor</code> to take direct <code>ByteBuffer</code> as input and heap <code>ByteBuffer</code> as output, or vice versa</li>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-29218">HBASE-29218</a>: Reduce calls to <code>Configuration#get()</code> in decompression path</li>
+    </ul>
+
+    <h2>Row seeking</h2>
+    <p>Row seeking is another extremely hot path. Even tiny allocations here add up a lot. I've eliminated a few. Solves for bullet points 1 and 2.</p>
+    <ul>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-29252">HBASE-29252</a>: Reduce allocations in <code>RowIndexSeekerV1</code></li>
+      <li><a href="https://issues.apache.org/jira/browse/HBASE-29253">HBASE-29253</a>: Avoid allocating a new closure on every row processed by <code>StoreScanner</code></li>
+    </ul>
+
+    <h2>Less on-heap buffers</h2>
+    <p>The less <code>byte[]</code> we have on heap, the better, as you can read about in the intro. This section is about reducing sources of on-heap buffers, so we can get the benefits of using direct buffers.</p>
+    <ul>
+      <li>No threshold to use direct <code>ByteBuff</code>s from <code>ByteBuffAllocator</code>. By default, the <code>ByteBuffAllocator</code> wants to allocate on-heap buffers when a small buffer is requested, and used a pooled direct buffer when a large enough buffer is requested. In practice, there are plenty of direct buffers in the pool, and no reason not use them as much as possible. Reduce the threshold to use a direct buffer down to 0 bytes. This solves for bullet point 1, 2, and 3.</li>
+      <li>No hedged reads in the <code>DFSClient</code>. In principal, hedged reads are a good idea. If a read from a DataNode is taking longer than a certain threshold, more reads are launched in parallel to the DataNodes hosting the other replicas of that block. In practice, using hedged reads incurs extra <code>byte[]</code> <a href="https://github.com/HubSpot/hadoop/blob/hubspot-3.3.6/hadoop-hdfs-project/hadoop-hdfs-client/src/main/java/org/apache/hadoop/hdfs/DFSInputStream.java#L1292">allocations and copies</a>, even in the fast path where no secondary reads are launched. If hedged reads are disabled, and the first DataNode attempted is local, the read will short-circuit. If you've passed a direct <code>ByteBuffer</code> to the <code>DFSInputStream</code> as your output buffer, as we do, this will get threaded all the way into the <code>pread</code> system call. This solves for bullet points 1, 2, and 4.</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+  function toggle(header) {
+    const body = header.nextElementSibling;
+    const arrow = header.querySelector('.main-toggle, .sub-toggle');
+    const isOpen = body.classList.contains('open');
+    body.classList.toggle('open', !isOpen);
+    arrow.classList.toggle('open', !isOpen);
+  }
+  hljs.highlightAll();
+</script>
+</body>
+</html>
